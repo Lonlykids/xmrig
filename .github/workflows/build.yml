@@ -1,0 +1,482 @@
+name: XMRig Auto Build No Donate
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC 时间；北京时间每天 02:23、08:23、14:23、20:23 检查。
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xmrig-auto-build-no-donate
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: 检查官方正式版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build_needed: ${{ steps.version.outputs.build_needed }}
+      upstream_tag: ${{ steps.version.outputs.upstream_tag }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+      deps_sha: ${{ steps.version.outputs.deps_sha }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - name: 判断是否需要编译
+        id: version
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const upstream = { owner: 'xmrig', repo: 'xmrig' };
+            const { data: release } = await github.rest.repos.getLatestRelease(upstream);
+            const tag = release.tag_name;
+            if (release.draft || release.prerelease ||
+                !/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) {
+              throw new Error('官方版本标签格式发生变化，需要检查工作流。');
+            }
+            const ownTag = `${tag}-no-donate-x64`;
+            core.setOutput('upstream_tag', tag);
+            core.setOutput('release_tag', ownTag);
+
+            let ownRelease = null;
+            try {
+              const result = await github.rest.repos.getReleaseByTag({
+                ...context.repo, tag: ownTag
+              });
+              ownRelease = result.data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            const expectedAssets = [
+              `xmrig-${tag}-windows-x64-no-donate.zip`,
+              `xmrig-${tag}-linux-x64-no-donate.tar.gz`,
+              `xmrig-${tag}-patched-source.zip`,
+              'SHA256SUMS.txt'
+            ];
+            if (ownRelease && !ownRelease.draft) {
+              const complete = expectedAssets.every(name =>
+                ownRelease.assets.some(asset =>
+                  asset.name === name && asset.state === 'uploaded' && asset.size > 0
+                )
+              );
+              if (!complete) {
+                throw new Error('已发布的同名版本附件不完整，请先人工检查该 Release。');
+              }
+              core.setOutput('build_needed', 'false');
+              await core.summary
+                .addHeading('版本检查')
+                .addRaw(`官方版本 ${tag} 已编译发布，本次跳过。`)
+                .write();
+              return;
+            }
+
+            // 固定源码与依赖的提交，避免检查后分支变化影响本次构建。
+            const source = await github.rest.repos.getCommit({
+              ...upstream, ref: tag
+            });
+            const depsRepo = { owner: 'xmrig', repo: 'xmrig-deps' };
+            const depsInfo = await github.rest.repos.get(depsRepo);
+            const deps = await github.rest.repos.getCommit({
+              ...depsRepo, ref: depsInfo.data.default_branch
+            });
+            core.setOutput('source_sha', source.data.sha);
+            core.setOutput('deps_sha', deps.data.sha);
+            core.setOutput('build_needed', 'true');
+            await core.summary
+              .addHeading('版本检查')
+              .addRaw(`发现待构建版本 ${tag}，开始编译 Windows x64 和 Linux x64。`)
+              .write();
+
+  build:
+    name: 编译 Windows x64
+    needs: check
+    if: needs.check.outputs.build_needed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+      UPSTREAM_SHA: ${{ needs.check.outputs.source_sha }}
+      DEPS_SHA: ${{ needs.check.outputs.deps_sha }}
+      RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: 获取本次工作流
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: automation
+          persist-credentials: false
+
+      - name: 获取官方正式版源码
+        uses: actions/checkout@v7
+        with:
+          repository: xmrig/xmrig
+          ref: ${{ needs.check.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: 获取官方编译依赖
+        uses: actions/checkout@v7
+        with:
+          repository: xmrig/xmrig-deps
+          ref: ${{ needs.check.outputs.deps_sha }}
+          path: deps
+          persist-credentials: false
+
+      - &disable_donate
+        name: 关闭捐赠并检查修改结果
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:GITHUB_WORKSPACE 'source/src/donate.h'
+          $text = Get-Content -LiteralPath $path -Raw
+          foreach ($name in @('kDefaultDonateLevel', 'kMinimumDonateLevel')) {
+            $pattern = '(\b' + [regex]::Escape($name) + '\s*=\s*)\d+(\s*;)'
+            if ([regex]::Matches($text, $pattern).Count -ne 1) {
+              throw "没有找到唯一的捐赠常量 $name，停止发布。"
+            }
+            $text = [regex]::Replace($text, $pattern, '${1}0${2}')
+            if (-not [regex]::IsMatch($text, '\b' + $name + '\s*=\s*0\s*;')) {
+              throw "捐赠常量 $name 未成功改为 0。"
+            }
+          }
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+          $configPath = Join-Path $env:GITHUB_WORKSPACE 'source/src/config.json'
+          $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -AsHashtable
+          $config['donate-level'] = 0
+          $config['donate-over-proxy'] = 0
+          $config | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $configPath -Encoding utf8
+          Write-Host '已确认两个捐赠常量和示例配置中的捐赠比例为 0。'
+
+      - name: 配置 Visual Studio 2022 编译
+        run: |
+          cmake -S source -B build -G "Visual Studio 17 2022" -A x64 "-DXMRIG_DEPS=$env:GITHUB_WORKSPACE/deps/msvc2022/x64"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake 配置失败。' }
+
+      - name: 编译 Release 程序
+        run: |
+          cmake --build build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'XMRig 编译失败。' }
+
+      - name: 检查程序是否能够启动
+        run: |
+          & "$env:GITHUB_WORKSPACE/build/Release/xmrig.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'XMRig 版本检查失败。' }
+
+      - name: 打包程序和修改后的源码
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binaryName = "xmrig-$env:UPSTREAM_TAG-windows-x64-no-donate"
+          $sourceName = "xmrig-$env:UPSTREAM_TAG-patched-source"
+          $package = Join-Path $env:GITHUB_WORKSPACE "package/$binaryName"
+          $sourcePackage = Join-Path $env:GITHUB_WORKSPACE "source-package/$sourceName"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Path $package, $sourcePackage, $dist -Force | Out-Null
+          Copy-Item -LiteralPath 'build/Release/xmrig.exe' -Destination $package
+          Copy-Item -LiteralPath 'source/LICENSE' -Destination $package
+
+          # 下载包的示例矿池默认关闭，实际使用时填写自己的矿池与钱包。
+          $config = Get-Content -LiteralPath 'source/src/config.json' -Raw | ConvertFrom-Json -AsHashtable
+          foreach ($pool in $config['pools']) {
+            $pool['url'] = 'YOUR_POOL_HOST:PORT'
+            $pool['user'] = 'YOUR_WALLET_ADDRESS'
+            $pool['enabled'] = $false
+          }
+          $config | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath "$package/config.json" -Encoding utf8
+          $driver = 'source/bin/WinRing0/WinRing0x64.sys'
+          if (Test-Path -LiteralPath $driver) {
+            Copy-Item -LiteralPath $driver -Destination $package
+            Copy-Item -LiteralPath 'source/bin/WinRing0/LICENSE' -Destination "$package/WinRing0-LICENSE"
+          }
+          $manifest = [ordered]@{
+            upstream_repository = 'xmrig/xmrig'
+            upstream_tag = $env:UPSTREAM_TAG
+            upstream_commit = $env:UPSTREAM_SHA
+            dependencies_repository = 'xmrig/xmrig-deps'
+            dependencies_commit = $env:DEPS_SHA
+            workflow_repository = $env:GITHUB_REPOSITORY
+            workflow_commit = $env:WORKFLOW_SHA
+            run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            donate_default = 0
+            donate_minimum = 0
+          }
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$package/BUILD-INFO.json" -Encoding utf8
+          @(
+            '本程序基于 XMRig 官方正式版本构建，默认捐赠比例和最低捐赠比例均为 0。'
+            '示例 config.json 的矿池默认关闭，请填写矿池、钱包并将 enabled 改为 true。'
+            '沿用原配置时，请将 donate-level 改为 0；启动参数也不要指定非零捐赠比例。'
+            '对应源码请下载同一 Release 中的 patched-source.zip 附件。'
+          ) | Set-Content -LiteralPath "$package/使用说明.txt" -Encoding utf8
+
+          $trackedFiles = @(git -C source ls-files)
+          if ($LASTEXITCODE -ne 0) { throw '获取源码文件列表失败。' }
+          foreach ($relative in $trackedFiles) {
+            $from = Join-Path "$env:GITHUB_WORKSPACE/source" $relative
+            $to = Join-Path $sourcePackage $relative
+            if (-not (Test-Path -LiteralPath $from -PathType Leaf)) {
+              throw "源码文件无法打包：$relative"
+            }
+            New-Item -ItemType Directory -Path (Split-Path -Parent $to) -Force | Out-Null
+            Copy-Item -LiteralPath $from -Destination $to
+          }
+          Copy-Item -LiteralPath "$package/BUILD-INFO.json" -Destination $sourcePackage
+          Copy-Item -LiteralPath 'automation/.github/workflows/build.yml' -Destination "$sourcePackage/BUILD-WORKFLOW.yml"
+          @(
+            '源码已将 src/donate.h 中的两个捐赠常量改为 0。'
+            'src/config.json 中的 donate-level 和 donate-over-proxy 已改为 0。'
+            'Windows x64 构建命令与官方依赖提交见 BUILD-WORKFLOW.yml 和 BUILD-INFO.json。'
+            '依赖仓库： https://github.com/xmrig/xmrig-deps'
+            'cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DXMRIG_DEPS=C:/xmrig-deps/msvc2022/x64'
+            'cmake --build build --config Release'
+            'Linux x64 使用 Ubuntu 22.04，先安装 build-essential、cmake、automake、libtool、autoconf。'
+            'Linux 依赖构建：先执行 chmod +x scripts/*.sh，再进入 scripts 目录执行 ./build_deps.sh，完成后返回源码根目录。'
+            'Linux 主程序构建：cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC=OFF -DXMRIG_DEPS=绝对路径/scripts/deps'
+            'cmake --build build --parallel 2'
+          ) | Set-Content -LiteralPath "$sourcePackage/构建说明.txt" -Encoding utf8
+          Compress-Archive -Path $package -DestinationPath "$dist/$binaryName.zip" -CompressionLevel Optimal
+          Compress-Archive -Path $sourcePackage -DestinationPath "$dist/$sourceName.zip" -CompressionLevel Optimal
+
+      - name: 上传 Windows 构建结果
+        uses: actions/upload-artifact@v7
+        with:
+          name: xmrig-windows-dist
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  build_linux:
+    name: 编译 Linux x64
+    needs: check
+    if: needs.check.outputs.build_needed == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+      UPSTREAM_SHA: ${{ needs.check.outputs.source_sha }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: 获取官方正式版源码
+        uses: actions/checkout@v7
+        with:
+          repository: xmrig/xmrig
+          ref: ${{ needs.check.outputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - *disable_donate
+
+      - name: 安装 Linux 构建工具
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake automake libtool autoconf pkg-config curl
+
+      - name: 构建官方 Linux 静态依赖
+        shell: bash
+        working-directory: source/scripts
+        run: |
+          set -euo pipefail
+          ./build_deps.sh
+
+      - name: 编译 Linux Release 程序
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S source -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC=OFF "-DXMRIG_DEPS=$GITHUB_WORKSPACE/source/scripts/deps"
+          cmake --build build --parallel 2
+
+      - name: 检查 Linux 程序和共享库要求
+        shell: bash
+        run: |
+          set -euo pipefail
+          file build/xmrig
+          ./build/xmrig --version
+          ldd build/xmrig | tee build/RUNTIME-LIBRARIES.txt
+          if grep -q 'not found' build/RUNTIME-LIBRARIES.txt; then
+            echo '程序存在未找到的共享库。' >&2
+            exit 1
+          fi
+          glibc_minimum="$(readelf --version-info build/xmrig | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1)"
+          if [[ -z "$glibc_minimum" ]]; then
+            echo '无法读取程序的 glibc 版本要求。' >&2
+            exit 1
+          fi
+          echo "MIN_GLIBC=$glibc_minimum" >> "$GITHUB_ENV"
+
+      - name: 打包 Linux 程序
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binaryName = "xmrig-$env:UPSTREAM_TAG-linux-x64-no-donate"
+          $package = Join-Path $env:GITHUB_WORKSPACE "package/$binaryName"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Path $package, $dist -Force | Out-Null
+          Copy-Item -LiteralPath 'build/xmrig' -Destination $package
+          Copy-Item -LiteralPath 'source/LICENSE' -Destination $package
+          Copy-Item -LiteralPath 'build/RUNTIME-LIBRARIES.txt' -Destination $package
+          $config = Get-Content -LiteralPath 'source/src/config.json' -Raw | ConvertFrom-Json -AsHashtable
+          foreach ($pool in $config['pools']) {
+            $pool['url'] = 'YOUR_POOL_HOST:PORT'
+            $pool['user'] = 'YOUR_WALLET_ADDRESS'
+            $pool['enabled'] = $false
+          }
+          $config | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath "$package/config.json" -Encoding utf8
+          $manifest = [ordered]@{
+            upstream_repository = 'xmrig/xmrig'
+            upstream_tag = $env:UPSTREAM_TAG
+            upstream_commit = $env:UPSTREAM_SHA
+            build_platform = 'Ubuntu 22.04 x64'
+            dependencies_source = '官方源码 scripts/build_deps.sh'
+            glibc_requirement = $env:MIN_GLIBC
+            workflow_repository = $env:GITHUB_REPOSITORY
+            workflow_commit = $env:WORKFLOW_SHA
+            run_url = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            donate_default = 0
+            donate_minimum = 0
+          }
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$package/BUILD-INFO.json" -Encoding utf8
+          @(
+            '本程序基于 XMRig 官方正式版本构建，默认和最低捐赠比例均为 0。'
+            '构建环境为 Ubuntu 22.04 x64；其他发行版需满足 BUILD-INFO.json 和 RUNTIME-LIBRARIES.txt 中的运行库要求。'
+            '此程序依赖 glibc，不能直接作为 Alpine/musl 程序使用。'
+            '示例 config.json 的矿池默认关闭，请填写矿池、钱包并将 enabled 改为 true。'
+            '沿用原配置时，请将 donate-level 改为 0；启动参数也不要指定非零捐赠比例。'
+            '启动命令：./xmrig --config=config.json'
+            '对应源码请下载同一 Release 中的 patched-source.zip 附件。'
+          ) | Set-Content -LiteralPath "$package/使用说明.txt" -Encoding utf8
+          chmod +x "$package/xmrig"
+          if ($LASTEXITCODE -ne 0) { throw '设置 Linux 程序执行权限失败。' }
+          tar -czf "$dist/$binaryName.tar.gz" -C (Split-Path -Parent $package) $binaryName
+          if ($LASTEXITCODE -ne 0) { throw '打包 Linux 程序失败。' }
+
+      - name: 上传 Linux 构建结果
+        uses: actions/upload-artifact@v7
+        with:
+          name: xmrig-linux-dist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: 发布双平台版本
+    needs: [check, build, build_linux]
+    if: needs.check.outputs.build_needed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+      UPSTREAM_SHA: ${{ needs.check.outputs.source_sha }}
+      DEPS_SHA: ${{ needs.check.outputs.deps_sha }}
+      RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: 下载 Windows 构建结果
+        uses: actions/download-artifact@v8
+        with:
+          name: xmrig-windows-dist
+          path: dist
+
+      - name: 下载 Linux 构建结果
+        uses: actions/download-artifact@v8
+        with:
+          name: xmrig-linux-dist
+          path: dist
+
+      - name: 检查双平台附件并生成校验值
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $expected = @(
+            "xmrig-$env:UPSTREAM_TAG-windows-x64-no-donate.zip"
+            "xmrig-$env:UPSTREAM_TAG-linux-x64-no-donate.tar.gz"
+            "xmrig-$env:UPSTREAM_TAG-patched-source.zip"
+          )
+          $archives = @(Get-ChildItem -LiteralPath $dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' })
+          if ($archives.Count -ne $expected.Count) { throw '下载的双平台附件数量不正确。' }
+          foreach ($name in $expected) {
+            $path = Join-Path $dist $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+              throw "缺少完整的平台附件：$name"
+            }
+          }
+          $archives | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath "$dist/SHA256SUMS.txt" -Encoding utf8
+          @(
+            "基于官方正式版本 $env:UPSTREAM_TAG 构建的 Windows x64 和 Linux x64 自编译程序。"
+            ''
+            '- 默认捐赠比例和最低捐赠比例均为 0。'
+            '- Windows 程序为 zip 包；Linux 程序为 tar.gz 包，保留执行权限。'
+            '- Linux 构建环境为 Ubuntu 22.04 x64，运行库要求记录在程序包中。'
+            '- Linux 程序依赖 glibc，不适用于直接在 Alpine/musl 环境运行。'
+            '- 配套源码请使用 patched-source.zip 附件，其中包含实际修改后的源码。'
+            '- 页面自动生成的 Source code 链接指向工作流仓库快照，请使用上述源码附件复现构建。'
+            "- 官方源码提交：$env:UPSTREAM_SHA"
+            "- Windows 官方依赖提交：$env:DEPS_SHA"
+            '- Linux 依赖使用该正式版本自带的 scripts/build_deps.sh 构建。'
+            "- 构建记录：$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            '- 沿用原来的配置时，请将 donate-level 改为 0。'
+          ) | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE/release-notes.md" -Encoding utf8
+
+      - name: 上传附件并发布到本仓库 Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 先保留为草稿，全部附件上传成功后再发布；失败的草稿可在下次运行时重试。
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+          }
+          $baseApi = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases"
+          # 按标签查询只能找到已发布版本；列表接口可读取本仓库的草稿。
+          function getrelease {
+            for ($page = 1; ; $page++) {
+              $items = @(Invoke-RestMethod -Uri "${baseApi}?per_page=100&page=$page" -Headers $headers)
+              $found = @($items | Where-Object { $_.tag_name -eq $env:RELEASE_TAG })
+              if ($found.Count -gt 1) { throw '发现多个同名版本，请人工检查。' }
+              if ($found.Count -eq 1) { return $found[0] }
+              if ($items.Count -lt 100) { return $null }
+            }
+          }
+          $existing = getrelease
+          if ($null -eq $existing) {
+            gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --target $env:WORKFLOW_SHA --draft --title "XMRig $env:UPSTREAM_TAG Windows/Linux x64 无捐赠版" --notes-file "$env:GITHUB_WORKSPACE/release-notes.md"
+            if ($LASTEXITCODE -ne 0) { throw '创建 Release 草稿失败。' }
+            $existing = getrelease
+            if ($null -eq $existing) { throw '创建后的 Release 草稿无法找到。' }
+          } elseif (-not $existing.draft) {
+            throw '同名 Release 已发布，停止覆盖。'
+          }
+          $files = @(Get-ChildItem -LiteralPath "$env:GITHUB_WORKSPACE/dist" -File | ForEach-Object { $_.FullName })
+          gh release upload $env:RELEASE_TAG @files --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw '上传 Release 附件失败。' }
+          $draft = Invoke-RestMethod -Uri "$baseApi/$($existing.id)" -Headers $headers
+          foreach ($file in $files) {
+            $name = Split-Path -Leaf $file
+            $size = (Get-Item -LiteralPath $file).Length
+            if (-not @($draft.assets | Where-Object { $_.name -eq $name -and $_.state -eq 'uploaded' -and $_.size -eq $size }).Count) {
+              throw "附件没有完整上传：$name"
+            }
+          }
+          gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false --latest --notes-file "$env:GITHUB_WORKSPACE/release-notes.md"
+          if ($LASTEXITCODE -ne 0) { throw '发布 Release 失败。' }
+          "下载页面：$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
