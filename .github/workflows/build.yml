@@ -447,24 +447,39 @@ jobs:
             Accept = 'application/vnd.github+json'
           }
           $baseApi = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases"
-          # 按标签查询只能找到已发布版本；列表接口可读取本仓库的草稿。
+          # GraphQL 支持按尚未创建的标签找到草稿，避免依赖 Release 列表。
           function getrelease {
-            for ($page = 1; ; $page++) {
-              $items = @(Invoke-RestMethod -Uri "${baseApi}?per_page=100&page=$page" -Headers $headers)
-              $found = @($items | Where-Object { $_.tag_name -eq $env:RELEASE_TAG })
-              if ($found.Count -gt 1) { throw '发现多个同名版本，请人工检查。' }
-              if ($found.Count -eq 1) { return $found[0] }
-              if ($items.Count -lt 100) { return $null }
+            $repository = $env:GITHUB_REPOSITORY.Split('/')
+            $request = @{
+              query = 'query($owner: String!, $name: String!, $tag: String!) { repository(owner: $owner, name: $name) { release(tagName: $tag) { databaseId isDraft tagName } } }'
+              variables = @{ owner = $repository[0]; name = $repository[1]; tag = $env:RELEASE_TAG }
+            } | ConvertTo-Json -Depth 10
+            $response = Invoke-RestMethod -Method Post -Uri "$env:GITHUB_API_URL/graphql" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $request
+            if ($response.errors) { throw ($response.errors | ConvertTo-Json -Depth 10) }
+            if ($null -eq $response.data.repository) { throw '无法读取本仓库的 Release 信息。' }
+            $release = $response.data.repository.release
+            if ($null -eq $release) { return $null }
+            if (-not $release.databaseId -or $release.tagName -ne $env:RELEASE_TAG) {
+              throw '草稿查询返回了无效的版本信息。'
             }
+            return Invoke-RestMethod -Uri "$baseApi/$($release.databaseId)" -Headers $headers
           }
           $existing = getrelease
           if ($null -eq $existing) {
-            gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --target $env:WORKFLOW_SHA --draft --title "XMRig $env:UPSTREAM_TAG Windows/Linux x64 无捐赠版" --notes-file "$env:GITHUB_WORKSPACE/release-notes.md"
-            if ($LASTEXITCODE -ne 0) { throw '创建 Release 草稿失败。' }
-            $existing = getrelease
-            if ($null -eq $existing) { throw '创建后的 Release 草稿无法找到。' }
+            $request = @{
+              tag_name = $env:RELEASE_TAG
+              target_commitish = $env:WORKFLOW_SHA
+              name = "XMRig $env:UPSTREAM_TAG Windows/Linux x64 无捐赠版"
+              body = Get-Content -LiteralPath "$env:GITHUB_WORKSPACE/release-notes.md" -Raw
+              draft = $true
+              prerelease = $false
+            } | ConvertTo-Json -Depth 10
+            $existing = Invoke-RestMethod -Method Post -Uri $baseApi -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $request
           } elseif (-not $existing.draft) {
             throw '同名 Release 已发布，停止覆盖。'
+          }
+          if (-not $existing.id -or -not $existing.draft -or $existing.tag_name -ne $env:RELEASE_TAG) {
+            throw '创建或读取的 Release 草稿信息无效。'
           }
           $files = @(Get-ChildItem -LiteralPath "$env:GITHUB_WORKSPACE/dist" -File | ForEach-Object { $_.FullName })
           gh release upload $env:RELEASE_TAG @files --repo $env:GITHUB_REPOSITORY --clobber
@@ -477,6 +492,12 @@ jobs:
               throw "附件没有完整上传：$name"
             }
           }
-          gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false --latest --notes-file "$env:GITHUB_WORKSPACE/release-notes.md"
-          if ($LASTEXITCODE -ne 0) { throw '发布 Release 失败。' }
+          $request = @{
+            draft = $false
+            make_latest = 'true'
+            target_commitish = $env:WORKFLOW_SHA
+            body = Get-Content -LiteralPath "$env:GITHUB_WORKSPACE/release-notes.md" -Raw
+          } | ConvertTo-Json -Depth 10
+          $published = Invoke-RestMethod -Method Patch -Uri "$baseApi/$($existing.id)" -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $request
+          if ($published.draft -or $published.tag_name -ne $env:RELEASE_TAG) { throw 'Release 未成功发布。' }
           "下载页面：$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
